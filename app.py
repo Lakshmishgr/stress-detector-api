@@ -1,32 +1,59 @@
 from flask import Flask, request, jsonify
-import sqlite3
-import numpy as np
 import os
+import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import numpy as np
 
 app = Flask(__name__)
 
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
 def get_db_connection():
-    conn = sqlite3.connect('stress_data.db')
-    conn.row_factory = sqlite3.Row
-    return conn
+    if DATABASE_URL:
+        # Connects to Neon PostgreSQL over SSL
+        return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    else:
+        # Local fallback if running on laptop without DATABASE_URL
+        conn = sqlite3.connect('stress_data.db')
+        conn.row_factory = sqlite3.Row
+        return conn
 
 def init_db():
     conn = get_db_connection()
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS daily_telemetry (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            device_id TEXT,
-            screen_on_time_minutes INTEGER,
-            unlock_count INTEGER,
-            night_usage_minutes INTEGER,
-            step_count INTEGER,
-            backspace_count INTEGER DEFAULT 0,
-            avg_typing_speed_ms INTEGER DEFAULT 0,
-            stress_score INTEGER DEFAULT 50,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+    cur = conn.cursor()
+    if DATABASE_URL:
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS daily_telemetry (
+                id SERIAL PRIMARY KEY,
+                device_id TEXT,
+                screen_on_time_minutes INTEGER,
+                unlock_count INTEGER,
+                night_usage_minutes INTEGER,
+                step_count INTEGER,
+                backspace_count INTEGER DEFAULT 0,
+                avg_typing_speed_ms INTEGER DEFAULT 0,
+                stress_score INTEGER DEFAULT 50,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+    else:
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS daily_telemetry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT,
+                screen_on_time_minutes INTEGER,
+                unlock_count INTEGER,
+                night_usage_minutes INTEGER,
+                step_count INTEGER,
+                backspace_count INTEGER DEFAULT 0,
+                avg_typing_speed_ms INTEGER DEFAULT 0,
+                stress_score INTEGER DEFAULT 50,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
     conn.commit()
+    cur.close()
     conn.close()
 
 init_db()
@@ -45,11 +72,16 @@ def generate_ai_counselor_advice(score, screen, night, steps, backspaces):
 
 def calculate_stress_index(device_id, screen, unlocks, night, steps, backspaces):
     conn = get_db_connection()
-    history = conn.execute(
-        '''SELECT screen_on_time_minutes, unlock_count, night_usage_minutes, step_count, backspace_count 
-           FROM daily_telemetry WHERE device_id = ? ORDER BY id DESC LIMIT 14''',
+    cur = conn.cursor()
+    placeholder = "%s" if DATABASE_URL else "?"
+
+    cur.execute(
+        f'''SELECT screen_on_time_minutes, unlock_count, night_usage_minutes, step_count, backspace_count 
+            FROM daily_telemetry WHERE device_id = {placeholder} ORDER BY id DESC LIMIT 14''',
         (device_id,)
-    ).fetchall()
+    )
+    history = cur.fetchall()
+    cur.close()
     conn.close()
 
     if len(history) < 3:
@@ -83,7 +115,8 @@ def calculate_stress_index(device_id, screen, unlocks, night, steps, backspaces)
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return jsonify({"status": "online", "service": "Passive Stress Biomarker API"}), 200
+    db_type = "Neon PostgreSQL (Persistent)" if DATABASE_URL else "Local SQLite"
+    return jsonify({"status": "online", "database": db_type}), 200
 
 @app.route('/api/v1/telemetry', methods=['POST'])
 def receive_telemetry():
@@ -103,13 +136,17 @@ def receive_telemetry():
         status, advice = generate_ai_counselor_advice(score, screen, night, steps, backspaces)
 
         conn = get_db_connection()
-        conn.execute(
-            '''INSERT INTO daily_telemetry 
-               (device_id, screen_on_time_minutes, unlock_count, night_usage_minutes, step_count, backspace_count, avg_typing_speed_ms, stress_score) 
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+        cur = conn.cursor()
+        placeholder = "%s" if DATABASE_URL else "?"
+
+        cur.execute(
+            f'''INSERT INTO daily_telemetry 
+                (device_id, screen_on_time_minutes, unlock_count, night_usage_minutes, step_count, backspace_count, avg_typing_speed_ms, stress_score) 
+                VALUES ({placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder})''',
             (device_id, screen, unlocks, night, steps, backspaces, typing_speed, score)
         )
         conn.commit()
+        cur.close()
         conn.close()
 
         return jsonify({
@@ -125,11 +162,16 @@ def receive_telemetry():
 @app.route('/api/v1/history/<device_id>', methods=['GET'])
 def get_history(device_id):
     conn = get_db_connection()
-    rows = conn.execute(
-        '''SELECT stress_score, screen_on_time_minutes, unlock_count, step_count, backspace_count, timestamp 
-           FROM daily_telemetry WHERE device_id = ? ORDER BY id DESC LIMIT 7''',
+    cur = conn.cursor()
+    placeholder = "%s" if DATABASE_URL else "?"
+
+    cur.execute(
+        f'''SELECT stress_score, screen_on_time_minutes, unlock_count, step_count, backspace_count, timestamp 
+            FROM daily_telemetry WHERE device_id = {placeholder} ORDER BY id DESC LIMIT 7''',
         (device_id,)
-    ).fetchall()
+    )
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
     return jsonify({"history": [dict(row) for row in rows]}), 200
 
