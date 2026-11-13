@@ -2,9 +2,10 @@ from flask import Flask, request, jsonify
 import os
 import sqlite3
 import ssl
+import math
+import statistics
 from urllib.parse import urlparse
 import pg8000.native
-import numpy as np
 
 app = Flask(__name__)
 
@@ -61,6 +62,11 @@ def init_db():
 
 init_db()
 
+def get_mean_std(values):
+    mean_val = float(statistics.mean(values))
+    std_val = float(statistics.pstdev(values)) if len(values) > 1 else 1.0
+    return mean_val, max(std_val, 1.0)
+
 def generate_ai_counselor_advice(score, screen, night, steps, backspaces):
     if score < 40:
         status = "Low Stress (Optimal Balance)"
@@ -108,17 +114,11 @@ def calculate_stress_index(device_id, screen, unlocks, night, steps, backspaces)
         step_m, step_s = 5000.0, 1500.0
         backspace_m, backspace_s = 15.0, 5.0
     else:
-        screens = [row['screen_on_time_minutes'] for row in history]
-        unlocks_list = [row['unlock_count'] for row in history]
-        nights = [row['night_usage_minutes'] for row in history]
-        steps_list = [row['step_count'] for row in history]
-        backspaces_list = [row['backspace_count'] or 0 for row in history]
-
-        screen_m, screen_s = float(np.mean(screens)), max(float(np.std(screens)), 1.0)
-        unlock_m, unlock_s = float(np.mean(unlocks_list)), max(float(np.std(unlocks_list)), 1.0)
-        night_m, night_s = float(np.mean(nights)), max(float(np.std(nights)), 1.0)
-        step_m, step_s = float(np.mean(steps_list)), max(float(np.std(steps_list)), 1.0)
-        backspace_m, backspace_s = float(np.mean(backspaces_list)), max(float(np.std(backspaces_list)), 1.0)
+        screen_m, screen_s = get_mean_std([row['screen_on_time_minutes'] for row in history])
+        unlock_m, unlock_s = get_mean_std([row['unlock_count'] for row in history])
+        night_m, night_s = get_mean_std([row['night_usage_minutes'] for row in history])
+        step_m, step_s = get_mean_std([row['step_count'] for row in history])
+        backspace_m, backspace_s = get_mean_std([row['backspace_count'] or 0 for row in history])
 
     z_screen = (screen - screen_m) / screen_s
     z_unlocks = (unlocks - unlock_m) / unlock_s
@@ -127,7 +127,7 @@ def calculate_stress_index(device_id, screen, unlocks, night, steps, backspaces)
     z_backspace = (backspaces - backspace_m) / backspace_s
 
     composite_z = (0.25 * z_screen) + (0.20 * z_unlocks) + (0.20 * z_night) + (0.15 * z_steps) + (0.20 * z_backspace)
-    stress_score = int(100 / (1 + np.exp(-composite_z)))
+    stress_score = int(100 / (1 + math.exp(-composite_z)))
     return stress_score
 
 @app.route('/', methods=['GET'])
