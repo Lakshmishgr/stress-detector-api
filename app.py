@@ -1,29 +1,31 @@
 from flask import Flask, request, jsonify
 import os
 import sqlite3
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import ssl
+from urllib.parse import urlparse
+import pg8000.native
 import numpy as np
 
 app = Flask(__name__)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-def get_db_connection():
-    if DATABASE_URL:
-        # Connects to Neon PostgreSQL over SSL
-        return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-    else:
-        # Local fallback if running on laptop without DATABASE_URL
-        conn = sqlite3.connect('stress_data.db')
-        conn.row_factory = sqlite3.Row
-        return conn
+def get_pg_connection():
+    parsed = urlparse(DATABASE_URL)
+    ssl_context = ssl.create_default_context()
+    return pg8000.native.Connection(
+        user=parsed.username,
+        password=parsed.password,
+        host=parsed.hostname,
+        port=parsed.port or 5432,
+        database=parsed.path.lstrip('/'),
+        ssl_context=ssl_context
+    )
 
 def init_db():
-    conn = get_db_connection()
-    cur = conn.cursor()
     if DATABASE_URL:
-        cur.execute('''
+        conn = get_pg_connection()
+        conn.run('''
             CREATE TABLE IF NOT EXISTS daily_telemetry (
                 id SERIAL PRIMARY KEY,
                 device_id TEXT,
@@ -37,8 +39,10 @@ def init_db():
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        conn.close()
     else:
-        cur.execute('''
+        conn = sqlite3.connect('stress_data.db')
+        conn.execute('''
             CREATE TABLE IF NOT EXISTS daily_telemetry (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 device_id TEXT,
@@ -52,9 +56,8 @@ def init_db():
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-    conn.commit()
-    cur.close()
-    conn.close()
+        conn.commit()
+        conn.close()
 
 init_db()
 
@@ -71,18 +74,32 @@ def generate_ai_counselor_advice(score, screen, night, steps, backspaces):
     return status, advice
 
 def calculate_stress_index(device_id, screen, unlocks, night, steps, backspaces):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    placeholder = "%s" if DATABASE_URL else "?"
-
-    cur.execute(
-        f'''SELECT screen_on_time_minutes, unlock_count, night_usage_minutes, step_count, backspace_count 
-            FROM daily_telemetry WHERE device_id = {placeholder} ORDER BY id DESC LIMIT 14''',
-        (device_id,)
-    )
-    history = cur.fetchall()
-    cur.close()
-    conn.close()
+    if DATABASE_URL:
+        conn = get_pg_connection()
+        rows = conn.run(
+            '''SELECT screen_on_time_minutes, unlock_count, night_usage_minutes, step_count, backspace_count 
+               FROM daily_telemetry WHERE device_id = :device_id ORDER BY id DESC LIMIT 14''',
+            device_id=device_id
+        )
+        conn.close()
+        history = [
+            {
+                'screen_on_time_minutes': r[0],
+                'unlock_count': r[1],
+                'night_usage_minutes': r[2],
+                'step_count': r[3],
+                'backspace_count': r[4]
+            } for r in rows
+        ]
+    else:
+        conn = sqlite3.connect('stress_data.db')
+        conn.row_factory = sqlite3.Row
+        history = conn.execute(
+            '''SELECT screen_on_time_minutes, unlock_count, night_usage_minutes, step_count, backspace_count 
+               FROM daily_telemetry WHERE device_id = ? ORDER BY id DESC LIMIT 14''',
+            (device_id,)
+        ).fetchall()
+        conn.close()
 
     if len(history) < 3:
         screen_m, screen_s = 240.0, 60.0
@@ -135,19 +152,26 @@ def receive_telemetry():
         score = calculate_stress_index(device_id, screen, unlocks, night, steps, backspaces)
         status, advice = generate_ai_counselor_advice(score, screen, night, steps, backspaces)
 
-        conn = get_db_connection()
-        cur = conn.cursor()
-        placeholder = "%s" if DATABASE_URL else "?"
-
-        cur.execute(
-            f'''INSERT INTO daily_telemetry 
-                (device_id, screen_on_time_minutes, unlock_count, night_usage_minutes, step_count, backspace_count, avg_typing_speed_ms, stress_score) 
-                VALUES ({placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder})''',
-            (device_id, screen, unlocks, night, steps, backspaces, typing_speed, score)
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
+        if DATABASE_URL:
+            conn = get_pg_connection()
+            conn.run(
+                '''INSERT INTO daily_telemetry 
+                   (device_id, screen_on_time_minutes, unlock_count, night_usage_minutes, step_count, backspace_count, avg_typing_speed_ms, stress_score) 
+                   VALUES (:device_id, :screen, :unlocks, :night, :steps, :backspaces, :typing_speed, :score)''',
+                device_id=device_id, screen=screen, unlocks=unlocks, night=night,
+                steps=steps, backspaces=backspaces, typing_speed=typing_speed, score=score
+            )
+            conn.close()
+        else:
+            conn = sqlite3.connect('stress_data.db')
+            conn.execute(
+                '''INSERT INTO daily_telemetry 
+                   (device_id, screen_on_time_minutes, unlock_count, night_usage_minutes, step_count, backspace_count, avg_typing_speed_ms, stress_score) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                (device_id, screen, unlocks, night, steps, backspaces, typing_speed, score)
+            )
+            conn.commit()
+            conn.close()
 
         return jsonify({
             "status": "success",
@@ -161,19 +185,36 @@ def receive_telemetry():
 
 @app.route('/api/v1/history/<device_id>', methods=['GET'])
 def get_history(device_id):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    placeholder = "%s" if DATABASE_URL else "?"
+    if DATABASE_URL:
+        conn = get_pg_connection()
+        rows = conn.run(
+            '''SELECT stress_score, screen_on_time_minutes, unlock_count, step_count, backspace_count, timestamp 
+               FROM daily_telemetry WHERE device_id = :device_id ORDER BY id DESC LIMIT 7''',
+            device_id=device_id
+        )
+        conn.close()
+        history = [
+            {
+                'stress_score': r[0],
+                'screen_on_time_minutes': r[1],
+                'unlock_count': r[2],
+                'step_count': r[3],
+                'backspace_count': r[4],
+                'timestamp': str(r[5])
+            } for r in rows
+        ]
+    else:
+        conn = sqlite3.connect('stress_data.db')
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            '''SELECT stress_score, screen_on_time_minutes, unlock_count, step_count, backspace_count, timestamp 
+               FROM daily_telemetry WHERE device_id = ? ORDER BY id DESC LIMIT 7''',
+            (device_id,)
+        ).fetchall()
+        conn.close()
+        history = [dict(row) for row in rows]
 
-    cur.execute(
-        f'''SELECT stress_score, screen_on_time_minutes, unlock_count, step_count, backspace_count, timestamp 
-            FROM daily_telemetry WHERE device_id = {placeholder} ORDER BY id DESC LIMIT 7''',
-        (device_id,)
-    )
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return jsonify({"history": [dict(row) for row in rows]}), 200
+    return jsonify({"history": history}), 200
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
